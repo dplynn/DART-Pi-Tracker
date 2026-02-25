@@ -1,0 +1,8 @@
+route_id,route_short_name,route_long_name,route_desc,route_url,route_color,route_text_color,route_type
+35781,Green Line,4th Street,Serves 4th Street starting at Walmart @ 49 6:30 AM - 6:00 PM,,00ff00,,3
+35782,Gold Line,USM,Serves USM starting at Hillcrest Lot 7:00 AM - 6:00 PM M-F,,ffff00,,3
+35783,Red Line,Country Club Road,Serves Country Club Rd starting at Walmart@49 6:30 AM - 5:50 PM M-F,,e80000,ffffff,3
+35784,Orange Line,Broadway Drive,Serves Broadway Dr starting at the Train Depot 6:30 AM - 5:50 PM M-F,,ff8000,,3
+35785,Brown Line,7th Street,Serves 7th Street starting at the Train Depot 6:30 AM - 5:45 PM M-F,,3d0000,ffffff,3
+35786,Purple Line,Palmer's Crossing,Serves Palmer's crossing starting at the Train Depot 7:00 AM - 5:00 PM M-F,,aa00aa,ffffff,3
+35780,Blue Line,Hardy Street,Serves Hardy Street starting at the Train Depot 6:00 AM - 6:00 PM M-F,,0080ff,ffffff,3
