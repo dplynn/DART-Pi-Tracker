@@ -37,6 +37,28 @@ const VEHICLE_TYPE_LABELS = {
   train: "Train",
 };
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchJsonWithLoadingRetry(url, attempts = 40, delayMs = 1500) {
+  for (let i = 0; i < attempts; i += 1) {
+    const res = await fetch(url);
+    if (res.ok) return res.json();
+    if (res.status !== 503) throw new Error(`Request failed: ${res.status}`);
+    let payload = null;
+    try {
+      payload = await res.json();
+    } catch (_) {
+      payload = null;
+    }
+    if (!payload?.loading) throw new Error(payload?.error || "Request failed");
+    setStatus(payload.error || "Loading feed data...");
+    await sleep(delayMs);
+  }
+  throw new Error("Timed out waiting for GTFS data load");
+}
+
 function setStatus(text) {
   statusEl.textContent = text;
 }
@@ -206,9 +228,7 @@ function buildDallasTrainLineFilter() {
 }
 
 async function loadRoutes(cityId) {
-  const res = await fetch(`/api/routes?city=${encodeURIComponent(cityId)}`);
-  if (!res.ok) throw new Error("Failed to load routes");
-  const geojson = await res.json();
+  const geojson = await fetchJsonWithLoadingRetry(`/api/routes?city=${encodeURIComponent(cityId)}`);
   const features = geojson?.features || [];
 
   const presentTypes = new Set(features.map((f) => f?.properties?.vehicle_type || "other").filter(Boolean));
@@ -339,9 +359,7 @@ function renderVehicles(payload) {
 }
 
 async function loadVehicles(cityId) {
-  const res = await fetch(`/api/vehicles?city=${encodeURIComponent(cityId)}`);
-  if (!res.ok) throw new Error("Failed to load vehicles");
-  const payload = await res.json();
+  const payload = await fetchJsonWithLoadingRetry(`/api/vehicles?city=${encodeURIComponent(cityId)}`);
   renderVehicles(payload);
 }
 

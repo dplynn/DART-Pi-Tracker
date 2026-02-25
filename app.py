@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -54,6 +55,8 @@ app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 cache_lock = threading.Lock()
 data_cache: dict[str, dict[str, Any]] = {}
 initialized = False
+loading_cities: set[str] = set()
+loading_lock = threading.Lock()
 
 
 def parse_gtfs_time_seconds(value: str | float | int | None) -> int | None:
@@ -74,13 +77,27 @@ def parse_gtfs_time_seconds(value: str | float | int | None) -> int | None:
     return (hours * 3600) + (minutes * 60) + seconds
 
 
-def safe_read_csv(gtfs_dir: Path, filename: str, required: bool = True) -> pd.DataFrame:
+def safe_read_csv(
+    gtfs_dir: Path, filename: str, required: bool = True, usecols: list[str] | None = None
+) -> pd.DataFrame:
     path = gtfs_dir / filename
     if not path.exists():
         if required:
             raise FileNotFoundError(f"Missing required GTFS file: {filename}")
         return pd.DataFrame()
-    return pd.read_csv(path, dtype=str)
+    return pd.read_csv(path, dtype=str, usecols=usecols, low_memory=False)
+
+
+def parse_gtfs_time_series(series: pd.Series) -> pd.Series:
+    text = series.fillna("").astype(str).str.strip()
+    valid = text.str.match(r"^\d{1,3}:\d{1,2}:\d{1,2}$")
+    parts = text.where(valid).str.split(":", expand=True)
+    if parts is None or parts.shape[1] != 3:
+        return pd.to_numeric(pd.Series([None] * len(series)), errors="coerce")
+    h = pd.to_numeric(parts[0], errors="coerce")
+    m = pd.to_numeric(parts[1], errors="coerce")
+    s = pd.to_numeric(parts[2], errors="coerce")
+    return (h * 3600) + (m * 60) + s
 
 
 def download_and_extract(city_id: str, url: str) -> Path:
@@ -321,14 +338,49 @@ def point_on_shape(shape_obj: dict[str, Any], frac: float) -> tuple[float, float
 
 
 def preprocess_city(city_id: str, gtfs_dir: Path) -> dict[str, Any]:
-    routes_df = safe_read_csv(gtfs_dir, "routes.txt", required=True)
-    trips_df = safe_read_csv(gtfs_dir, "trips.txt", required=True)
-    shapes_df = safe_read_csv(gtfs_dir, "shapes.txt", required=False)
-    stops_df = safe_read_csv(gtfs_dir, "stops.txt", required=True)
-    stop_times_df = safe_read_csv(gtfs_dir, "stop_times.txt", required=True)
-    calendar_df = safe_read_csv(gtfs_dir, "calendar.txt", required=False)
-    calendar_dates_df = safe_read_csv(gtfs_dir, "calendar_dates.txt", required=False)
-    agency_df = safe_read_csv(gtfs_dir, "agency.txt", required=False)
+    routes_df = safe_read_csv(
+        gtfs_dir,
+        "routes.txt",
+        required=True,
+        usecols=["route_id", "route_short_name", "route_long_name", "route_desc", "route_color", "route_type"],
+    )
+    trips_df = safe_read_csv(
+        gtfs_dir,
+        "trips.txt",
+        required=True,
+        usecols=["trip_id", "route_id", "service_id", "shape_id", "trip_headsign"],
+    )
+    shapes_df = safe_read_csv(
+        gtfs_dir,
+        "shapes.txt",
+        required=False,
+        usecols=["shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"],
+    )
+    stops_df = safe_read_csv(
+        gtfs_dir,
+        "stops.txt",
+        required=True,
+        usecols=["stop_id", "stop_lat", "stop_lon"],
+    )
+    stop_times_df = safe_read_csv(
+        gtfs_dir,
+        "stop_times.txt",
+        required=True,
+        usecols=["trip_id", "stop_id", "stop_sequence", "arrival_time", "departure_time", "shape_dist_traveled"],
+    )
+    calendar_df = safe_read_csv(
+        gtfs_dir,
+        "calendar.txt",
+        required=False,
+        usecols=["service_id", "start_date", "end_date", *WEEKDAY_COLS],
+    )
+    calendar_dates_df = safe_read_csv(
+        gtfs_dir,
+        "calendar_dates.txt",
+        required=False,
+        usecols=["service_id", "date", "exception_type"],
+    )
+    agency_df = safe_read_csv(gtfs_dir, "agency.txt", required=False, usecols=["agency_timezone"])
 
     routes_df, trips_df = filter_routes_and_trips_for_city(city_id, routes_df, trips_df)
     route_features = build_route_features(routes_df, trips_df, shapes_df, stop_times_df, stops_df)
@@ -341,8 +393,8 @@ def preprocess_city(city_id: str, gtfs_dir: Path) -> dict[str, Any]:
 
     st = stop_times_df.copy().fillna("")
     st["stop_sequence"] = pd.to_numeric(st.get("stop_sequence"), errors="coerce")
-    st["arrival_sec"] = st.get("arrival_time", "").apply(parse_gtfs_time_seconds)
-    st["departure_sec"] = st.get("departure_time", "").apply(parse_gtfs_time_seconds)
+    st["arrival_sec"] = parse_gtfs_time_series(st.get("arrival_time", pd.Series(dtype=str)))
+    st["departure_sec"] = parse_gtfs_time_series(st.get("departure_time", pd.Series(dtype=str)))
     st["time_sec"] = st["departure_sec"].fillna(st["arrival_sec"])
     st["shape_dist_traveled"] = pd.to_numeric(st.get("shape_dist_traveled", ""), errors="coerce")
     st = st.dropna(subset=["trip_id", "stop_id", "stop_sequence", "time_sec"])
@@ -532,6 +584,31 @@ def refresh_city(city_id: str) -> dict[str, Any]:
     return city_data
 
 
+def _load_city_background(city_id: str) -> None:
+    global initialized
+    try:
+        refresh_city(city_id)
+        with cache_lock:
+            initialized = bool(data_cache)
+    except Exception:
+        pass
+    finally:
+        with loading_lock:
+            loading_cities.discard(city_id)
+
+
+def start_city_load(city_id: str) -> None:
+    with cache_lock:
+        if city_id in data_cache:
+            return
+    with loading_lock:
+        if city_id in loading_cities:
+            return
+        loading_cities.add(city_id)
+    t = threading.Thread(target=_load_city_background, args=(city_id,), daemon=True)
+    t.start()
+
+
 def refresh_all() -> dict[str, Any]:
     status: dict[str, Any] = {"ok": True, "updated": [], "errors": {}, "timestamp": datetime.utcnow().isoformat() + "Z"}
     for city_id in CITY_CONFIG:
@@ -551,7 +628,9 @@ def ensure_initialized() -> None:
     with cache_lock:
         if initialized:
             return
-    refresh_all()
+    # Avoid request-time heavy initialization under hosted worker timeouts.
+    for city_id in CITY_CONFIG:
+        start_city_load(city_id)
     with cache_lock:
         initialized = bool(data_cache)
 
@@ -570,12 +649,22 @@ def root() -> Any:
 
 @app.route("/health")
 def health() -> Any:
-    return jsonify({"ok": True, "initialized": initialized, "cities_loaded": sorted(list(data_cache.keys()))})
+    with loading_lock:
+        loading = sorted(list(loading_cities))
+    return jsonify(
+        {
+            "ok": True,
+            "initialized": initialized,
+            "cities_loaded": sorted(list(data_cache.keys())),
+            "cities_loading": loading,
+        }
+    )
 
 
 @app.route("/api/cities")
 def api_cities() -> Any:
-    ensure_initialized()
+    for city_id in CITY_CONFIG:
+        start_city_load(city_id)
     payload = [
         {
             "id": city_id,
@@ -590,30 +679,30 @@ def api_cities() -> Any:
 
 @app.route("/api/routes")
 def api_routes() -> Any:
-    ensure_initialized()
     try:
         city_id = city_or_400()
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
+    start_city_load(city_id)
     with cache_lock:
         city_data = data_cache.get(city_id)
     if not city_data:
-        return jsonify({"ok": False, "error": f"No data loaded for {city_id}"}), 503
+        return jsonify({"ok": False, "loading": True, "error": f"Loading data for {city_id}"}), 503
     return jsonify(city_data["route_geojson"])
 
 
 @app.route("/api/vehicles")
 def api_vehicles() -> Any:
-    ensure_initialized()
     try:
         city_id = city_or_400()
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
 
+    start_city_load(city_id)
     with cache_lock:
         city_data = data_cache.get(city_id)
     if not city_data:
-        return jsonify({"ok": False, "error": f"No data loaded for {city_id}"}), 503
+        return jsonify({"ok": False, "loading": True, "error": f"Loading data for {city_id}"}), 503
 
     tzinfo = city_data.get("timezone")
     now_local = datetime.now(tz=tzinfo) if tzinfo else datetime.now()
