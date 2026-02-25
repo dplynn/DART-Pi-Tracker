@@ -85,7 +85,15 @@ def safe_read_csv(
         if required:
             raise FileNotFoundError(f"Missing required GTFS file: {filename}")
         return pd.DataFrame()
-    return pd.read_csv(path, dtype=str, usecols=usecols, low_memory=False)
+    try:
+        return pd.read_csv(path, dtype=str, usecols=usecols, low_memory=False)
+    except ValueError:
+        # Some feeds omit optional columns. Fallback to full read and select existing fields.
+        df = pd.read_csv(path, dtype=str, low_memory=False)
+        if usecols is None:
+            return df
+        present = [c for c in usecols if c in df.columns]
+        return df[present]
 
 
 def parse_gtfs_time_series(series: pd.Series) -> pd.Series:
@@ -221,20 +229,27 @@ def build_route_features(
         )
         shape_route_map = dict(zip(trip_shape_map["shape_id"], trip_shape_map["route_id"]))
 
+        # Keep one representative shape per route to reduce payload/memory.
+        best_by_route: dict[str, dict[str, Any]] = {}
         for shape_id, grp in shapes.sort_values("shape_pt_sequence").groupby("shape_id"):
             coords = [[float(lon), float(lat)] for lat, lon in zip(grp["shape_pt_lat"], grp["shape_pt_lon"])]
             if len(coords) < 2:
                 continue
             route_id = shape_route_map.get(str(shape_id), "")
             meta = route_meta.get(route_id, {})
-            props = {"route_id": route_id, **meta}
-            features.append(
-                {
-                    "type": "Feature",
-                    "geometry": {"type": "LineString", "coordinates": coords},
-                    "properties": props,
+            if not route_id:
+                continue
+            prev = best_by_route.get(route_id)
+            if (not prev) or (len(coords) > prev["len"]):
+                best_by_route[route_id] = {
+                    "len": len(coords),
+                    "feature": {
+                        "type": "Feature",
+                        "geometry": {"type": "LineString", "coordinates": coords},
+                        "properties": {"route_id": route_id, **meta},
+                    },
                 }
-            )
+        features = [entry["feature"] for entry in best_by_route.values()]
 
     if features:
         return features
@@ -405,10 +420,36 @@ def preprocess_city(city_id: str, gtfs_dir: Path) -> dict[str, Any]:
             trips_subset[col] = ""
     trips_subset = trips_subset[["trip_id", "route_id", "service_id", "shape_id", "trip_headsign"]]
 
-    merged = st.merge(stops[["stop_id", "stop_lat", "stop_lon"]], on="stop_id", how="left")
-    merged = merged.merge(trips_subset, on="trip_id", how="left")
-    merged = merged.dropna(subset=["stop_lat", "stop_lon", "service_id"])
+    merged = st.merge(trips_subset, on="trip_id", how="left")
+    merged = merged.dropna(subset=["service_id", "route_id"])
     merged = merged.sort_values(["trip_id", "stop_sequence"]).reset_index(drop=True)
+
+    first = merged.groupby("trip_id", as_index=False).first()
+    last = merged.groupby("trip_id", as_index=False).last()
+    trip_summary = first[
+        ["trip_id", "route_id", "service_id", "shape_id", "trip_headsign", "time_sec", "stop_id"]
+    ].rename(columns={"time_sec": "start_sec", "stop_id": "start_stop_id"})
+    trip_summary = trip_summary.merge(
+        last[["trip_id", "time_sec", "stop_id"]].rename(columns={"time_sec": "end_sec", "stop_id": "end_stop_id"}),
+        on="trip_id",
+        how="left",
+    )
+    trip_summary = trip_summary[trip_summary["end_sec"] >= trip_summary["start_sec"]]
+    trip_summary = trip_summary.merge(
+        stops[["stop_id", "stop_lat", "stop_lon"]].rename(
+            columns={"stop_id": "start_stop_id", "stop_lat": "start_lat", "stop_lon": "start_lon"}
+        ),
+        on="start_stop_id",
+        how="left",
+    )
+    trip_summary = trip_summary.merge(
+        stops[["stop_id", "stop_lat", "stop_lon"]].rename(
+            columns={"stop_id": "end_stop_id", "stop_lat": "end_lat", "stop_lon": "end_lon"}
+        ),
+        on="end_stop_id",
+        how="left",
+    )
+    trip_summary = trip_summary.dropna(subset=["start_sec", "end_sec"]).reset_index(drop=True)
 
     route_label_map = {}
     route_color_map = {}
@@ -448,15 +489,15 @@ def preprocess_city(city_id: str, gtfs_dir: Path) -> dict[str, Any]:
         "vehicle_type_map": vehicle_type_map,
         "route_is_tre_map": route_is_tre_map,
         "shape_index": shape_index,
-        "trip_points": merged,
+        "trip_summary": trip_summary,
         "calendar": calendar_df.fillna(""),
         "calendar_dates": calendar_dates_df.fillna(""),
     }
 
 
 def compute_vehicle_positions(city_data: dict[str, Any], now_local: datetime) -> list[dict[str, Any]]:
-    trip_points: pd.DataFrame = city_data["trip_points"]
-    if trip_points.empty:
+    trip_summary: pd.DataFrame = city_data["trip_summary"]
+    if trip_summary.empty:
         return []
 
     calendar_df = city_data["calendar"]
@@ -474,48 +515,34 @@ def compute_vehicle_positions(city_data: dict[str, Any], now_local: datetime) ->
 
     def build_positions(scoped: pd.DataFrame, eval_sec: int, simulated: bool) -> list[dict[str, Any]]:
         local: list[dict[str, Any]] = []
-        bounds = scoped.groupby("trip_id")["time_sec"].agg(["min", "max"])
-        if bounds.empty:
+        active = scoped[(scoped["start_sec"] <= eval_sec) & (scoped["end_sec"] >= eval_sec)]
+        if active.empty:
             return local
-        active_trip_ids = bounds[(bounds["min"] <= eval_sec) & (bounds["max"] >= eval_sec)].index.tolist()
-        if not active_trip_ids:
-            return local
-
-        for trip_id in active_trip_ids:
+        for _, row in active.iterrows():
+            trip_id = str(row.get("trip_id", ""))
             if trip_id in seen_trips:
                 continue
-            tdf = scoped[scoped["trip_id"] == trip_id].sort_values("time_sec")
-            if len(tdf) < 2:
+            start_sec = int(row.get("start_sec", 0))
+            end_sec = int(row.get("end_sec", 0))
+            if end_sec <= start_sec:
                 continue
-            times = tdf["time_sec"].astype(int).to_numpy()
-            trip_start = int(times[0])
-            trip_end = int(times[-1])
-            idx = int(times.searchsorted(eval_sec, side="right"))
-            if idx <= 0:
-                p = tdf.iloc[0]
-                lat = float(p["stop_lat"])
-                lon = float(p["stop_lon"])
-                bearing = 0.0
-            elif idx >= len(tdf):
-                p = tdf.iloc[-1]
-                lat = float(p["stop_lat"])
-                lon = float(p["stop_lon"])
-                bearing = 0.0
-            else:
-                p1 = tdf.iloc[idx - 1]
-                p2 = tdf.iloc[idx]
-                t1 = int(p1["time_sec"])
-                t2 = int(p2["time_sec"])
-                ratio = 0.0 if t2 <= t1 else (eval_sec - t1) / (t2 - t1)
-                lat1, lon1 = float(p1["stop_lat"]), float(p1["stop_lon"])
-                lat2, lon2 = float(p2["stop_lat"]), float(p2["stop_lon"])
+
+            ratio = (eval_sec - start_sec) / (end_sec - start_sec)
+            ratio = min(1.0, max(0.0, ratio))
+
+            start_lat = row.get("start_lat")
+            start_lon = row.get("start_lon")
+            end_lat = row.get("end_lat")
+            end_lon = row.get("end_lon")
+            if pd.notna(start_lat) and pd.notna(start_lon) and pd.notna(end_lat) and pd.notna(end_lon):
+                lat1, lon1 = float(start_lat), float(start_lon)
+                lat2, lon2 = float(end_lat), float(end_lon)
                 lat = lat1 + (lat2 - lat1) * ratio
                 lon = lon1 + (lon2 - lon1) * ratio
-                dy = lat2 - lat1
-                dx = lon2 - lon1
-                bearing = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+                bearing = (math.degrees(math.atan2((lon2 - lon1), (lat2 - lat1))) + 360.0) % 360.0
+            else:
+                lat = lon = bearing = 0.0
 
-            row = tdf.iloc[0]
             route_id = str(row.get("route_id", ""))
             label = city_data["route_label_map"].get(route_id, route_id)
             route_color = city_data["route_color_map"].get(route_id, "#5b6671")
@@ -526,9 +553,8 @@ def compute_vehicle_positions(city_data: dict[str, Any], now_local: datetime) ->
             if vehicle_type == "train":
                 shape_id = str(row.get("shape_id", "")).strip()
                 shape_obj = shape_index.get(shape_id)
-                if shape_obj and trip_end > trip_start:
-                    frac = (eval_sec - trip_start) / (trip_end - trip_start)
-                    lat, lon, bearing = point_on_shape(shape_obj, frac)
+                if shape_obj:
+                    lat, lon, bearing = point_on_shape(shape_obj, ratio)
 
             local.append(
                 {
@@ -551,7 +577,7 @@ def compute_vehicle_positions(city_data: dict[str, Any], now_local: datetime) ->
         service_ids = service_ids_for_date(calendar_df, calendar_dates_df, service_day)
         if not service_ids:
             continue
-        scoped = trip_points[trip_points["service_id"].isin(service_ids)]
+        scoped = trip_summary[trip_summary["service_id"].isin(service_ids)]
         if scoped.empty:
             continue
         vehicles.extend(build_positions(scoped, eval_sec, simulated=False))
@@ -562,12 +588,11 @@ def compute_vehicle_positions(city_data: dict[str, Any], now_local: datetime) ->
     # Fallback mode: if no active vehicles now, simulate movement within the service span.
     service_ids_today = service_ids_for_date(calendar_df, calendar_dates_df, now_local.date())
     if service_ids_today:
-        scoped_today = trip_points[trip_points["service_id"].isin(service_ids_today)]
+        scoped_today = trip_summary[trip_summary["service_id"].isin(service_ids_today)]
         if not scoped_today.empty:
-            bounds = scoped_today.groupby("trip_id")["time_sec"].agg(["min", "max"])
-            if not bounds.empty:
-                min_sec = int(bounds["min"].min())
-                max_sec = int(bounds["max"].max())
+            if not scoped_today.empty:
+                min_sec = int(scoped_today["start_sec"].min())
+                max_sec = int(scoped_today["end_sec"].max())
                 span = max(1, max_sec - min_sec)
                 simulated_sec = min_sec + (now_sec_today % span)
                 vehicles.extend(build_positions(scoped_today, simulated_sec, simulated=True))
